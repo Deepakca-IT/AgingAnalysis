@@ -1,0 +1,160 @@
+import pandas as pd
+from tkinter import Tk, filedialog, simpledialog
+from collections import deque
+from datetime import datetime
+import os
+
+# -------------------- CONFIG -------------------- #
+CUTOFF_DATE = pd.to_datetime("2025-03-31")
+
+# -------------------- FILE SELECTION -------------------- #
+Tk().withdraw()
+file_path = filedialog.askopenfilename(title="Select Ledger Excel File", filetypes=[("Excel files", "*.xlsx *.xls")])
+if not file_path:
+    print("❌ No file selected.")
+    exit()
+
+# -------------------- FILE TYPE (Debtor/Creditor) -------------------- #
+file_type = simpledialog.askstring("Input", "Enter 'Debtor' or 'Creditor':").strip().lower()
+if file_type not in ['debtor', 'creditor']:
+    print("❌ Invalid entry. Please enter either 'Debtor' or 'Creditor'.")
+    exit()
+
+# -------------------- READ AND PARSE LEDGER -------------------- #
+df = pd.read_excel(file_path, header=None)
+records = []
+current_party = None
+
+for idx, row in df.iterrows():
+    # Detect new party
+    if str(row[0]).strip().lower().startswith("ledger:"):
+        current_party = str(row[1]).strip() if pd.notna(row[1]) else "Unknown"
+        continue
+
+    if current_party:
+        # Only consider rows with valid dates as transaction lines
+        date = pd.to_datetime(row[0] or 0, errors='coerce')
+        if pd.isna(date) or date < pd.Timestamp("2000-01-01"):
+            continue  # skip rows without valid date
+        try:
+            debit = float(row[5]) if not pd.isna(row[5]) else 0  # Column F
+            credit = float(row[6]) if not pd.isna(row[6]) else 0  # Column G
+        except:
+            continue
+        records.append([current_party, date, debit, credit])
+
+# Create dataframe
+data = pd.DataFrame(records, columns=["Party", "Date", "Debit", "Credit"])
+data = data.sort_values(by=["Party", "Date"])
+
+# -------------------- FIFO AGING + LOG -------------------- #
+def calculate_aging_fifo(df, cutoff_date, file_type):
+    aging_summary = []
+    log_details = []
+
+    for party, group in df.groupby("Party"):
+        group = group.sort_values("Date")
+        entries = deque()
+        advance_amount = 0
+
+        for _, row in group.iterrows():
+            if file_type == "creditor":
+                if pd.isna(row["Date"]):
+                    continue
+                # Credit = Bill, Debit = Payment
+                if row["Credit"] > 0:
+                    entries.append({'date': row["Date"], 'amount': row["Credit"], 'matched': 0})
+                elif row["Debit"] > 0:
+                    amt = row["Debit"]
+                    while amt > 0 and entries:
+                        bill = entries[0]
+                        available = bill["amount"] - bill["matched"]
+                        to_match = min(amt, available)
+                        bill["matched"] += to_match
+                        amt -= to_match
+                        if bill["matched"] == bill["amount"]:
+                            entries.popleft()
+
+            else:
+                # Debtor: Debit = Bill, Credit = Receipt
+                if pd.isna(row["Date"]):
+                    continue  # Skip summary/invalid rows
+                if row["Debit"] > 0:
+                    entries.append({'date': row["Date"], 'amount': row["Debit"], 'matched': 0})
+                elif row["Credit"] > 0:
+                    amt = row["Credit"]
+                    while amt > 0 and entries:
+                        invoice = entries[0]
+                        available = invoice["amount"] - invoice["matched"]
+                        to_match = min(amt, available)
+                        invoice["matched"] += to_match
+                        amt -= to_match
+                        if invoice["matched"] == invoice["amount"]:
+                            entries.popleft()
+                    # If anything left after matching => Advance
+                    if amt > 0:
+                        advance_amount += amt
+                        log_details.append({
+                            "Party": party,
+                            "Invoice Date": row["Date"],
+                            "Invoice Amount": "",
+                            "Matched Amount": "",
+                            "Unpaid Amount": amt,
+                            "Age (in days)": "",
+                            "Aging Bucket": "",
+                            "Remarks": "Advance from customer"
+                        })
+
+        # Aging buckets
+        buckets = {"0-30": 0, "31-60": 0, "61-90": 0, ">90": 0}
+        for entry in entries:
+            unpaid = entry["amount"] - entry["matched"]
+            if unpaid <= 0 or entry["date"] > cutoff_date:
+                continue
+            age = (cutoff_date - entry["date"]).days
+            if age <= 30:
+                bucket = "0-30"
+            elif age <= 60:
+                bucket = "31-60"
+            elif age <= 90:
+                bucket = "61-90"
+            else:
+                bucket = ">90"
+            buckets[bucket] += unpaid
+
+            # Log unmatched bill
+            log_details.append({
+                "Party": party,
+                "Invoice Date": entry["date"],
+                "Invoice Amount": entry["amount"],
+                "Matched Amount": entry["matched"],
+                "Unpaid Amount": unpaid,
+                "Age (in days)": age,
+                "Aging Bucket": bucket,
+                "Remarks": ""
+            })
+
+        # Final output per party
+        party_summary = {
+            "Party": party,
+            "Total Outstanding": sum(buckets.values()),
+            **buckets
+        }
+
+        if file_type == "debtor":
+            party_summary["Advance from Customer"] = advance_amount
+
+        aging_summary.append(party_summary)
+
+    return pd.DataFrame(aging_summary), pd.DataFrame(log_details)
+
+
+# -------------------- RUN AND EXPORT -------------------- #
+aging_df, log_df = calculate_aging_fifo(data, CUTOFF_DATE, file_type)
+
+output_path = os.path.splitext(file_path)[0] + f"_{file_type}_aging_report.xlsx"
+with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+    aging_df.to_excel(writer, sheet_name="Aging Summary", index=False)
+    log_df.to_excel(writer, sheet_name="FIFO Log", index=False)
+
+print(f"✅ Aging Report + Log saved to:\n{output_path}")
