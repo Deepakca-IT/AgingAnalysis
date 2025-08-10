@@ -1,0 +1,237 @@
+import pandas as pd
+from tkinter import Tk, filedialog, simpledialog, messagebox
+from collections import deque
+from datetime import datetime
+import os
+
+# -------------------- CONFIG -------------------- #
+cutoff_input = simpledialog.askstring("Cutoff Date", "Enter cutoff date (dd-mm-yyyy):", initialvalue="31-03-2025")
+try:
+    CUTOFF_DATE = pd.to_datetime(cutoff_input, dayfirst=True)
+except Exception as e:
+    messagebox.showerror("Invalid Date", f"Error parsing date: {e}")
+    raise SystemExit
+
+# -------------------- FILE SELECTION -------------------- #
+Tk().withdraw()
+file_path = filedialog.askopenfilename(title="Select Ledger Excel File", filetypes=[("Excel files", "*.xlsx *.xls")])
+if not file_path:
+    print("❌ No file selected.")
+    raise SystemExit
+
+# -------------------- READ AND PARSE LEDGER -------------------- #
+# This expects the same ledger-extracted format you were using:
+# rows where column0 starts with 'Ledger:' show a new Party name at column1
+# then rows containing transactions with date in col0, debit in col5, credit in col6
+df_raw = pd.read_excel(file_path, header=None)
+
+records = []
+current_party = None
+
+for idx, row in df_raw.iterrows():
+    first_col = str(row[0]) if not pd.isna(row[0]) else ""
+    if first_col.strip().lower().startswith("ledger:"):
+        current_party = str(row[1]).strip() if pd.notna(row[1]) else "Unknown"
+        continue
+
+    if current_party:
+        date = pd.to_datetime(row[0] or pd.NaT, errors='coerce', dayfirst=True)
+        if pd.isna(date) or date < pd.Timestamp("2000-01-01"):
+            continue
+        try:
+            debit = float(row[5]) if not pd.isna(row[5]) else 0.0
+            credit = float(row[6]) if not pd.isna(row[6]) else 0.0
+        except Exception:
+            # skip rows that cannot be parsed to numeric
+            continue
+        records.append([current_party, date, debit, credit])
+
+data = pd.DataFrame(records, columns=["Party", "Date", "Debit", "Credit"])
+data = data.sort_values(by=["Party", "Date"]).reset_index(drop=True)
+
+# -------------------- CREDITOR-ONLY FIFO AGING + 43B(h) -------------------- #
+def calculate_creditor_aging_and_43b(df, cutoff_date):
+    aging_summary = []
+    log_details = []         # FIFO log of outstanding invoices (as before)
+    disallow_43b = []        # final 43B report after after-cutoff allocations
+
+    for party, group in df.groupby("Party"):
+        group = group.sort_values("Date").reset_index(drop=True)
+
+        # --- Build unmatched invoices (purchases) and advances using only transactions <= cutoff ---
+        unmatched_bills = deque()       # items: {'date','amount','matched'} ; these are invoices as at cutoff
+        unmatched_advances = deque()   # advances (payments before cutoff) to be applied to purchases before cutoff
+
+        for _, row in group.iterrows():
+            txn_date = row["Date"]
+            if pd.isna(txn_date):
+                continue
+
+            # Payment (debit) BEFORE or ON cutoff -> treat as payment before cutoff
+            if row["Debit"] > 0 and txn_date <= cutoff_date:
+                amt = row["Debit"]
+                # Try to absorb into existing unmatched invoices (FIFO)
+                while amt > 0 and unmatched_bills:
+                    bill = unmatched_bills[0]
+                    avail = bill["amount"] - bill["matched"]
+                    to_match = min(avail, amt)
+                    bill["matched"] += to_match
+                    amt -= to_match
+                    if bill["matched"] == bill["amount"]:
+                        unmatched_bills.popleft()
+                # leftover -> advance (to be used against future purchases before cutoff)
+                if amt > 0:
+                    unmatched_advances.append({"date": txn_date, "amount": amt})
+
+            # Purchase (credit) BEFORE or ON cutoff -> invoice
+            elif row["Credit"] > 0 and txn_date <= cutoff_date:
+                bill_amt = row["Credit"]
+                # reduce against advances first (advance -> reduce invoice)
+                while bill_amt > 0 and unmatched_advances:
+                    adv = unmatched_advances[0]
+                    to_match = min(bill_amt, adv["amount"])
+                    bill_amt -= to_match
+                    adv["amount"] -= to_match
+                    if adv["amount"] <= 0:
+                        unmatched_advances.popleft()
+                # remaining becomes an outstanding invoice as at cutoff
+                if bill_amt > 0:
+                    unmatched_bills.append({"date": txn_date, "amount": bill_amt, "matched": 0})
+
+        # Any remaining advances are Advance to Supplier (before cutoff)
+        advance_amount = sum(a["amount"] for a in unmatched_advances)
+
+        # --- Build aging buckets and FIFO log (outstanding as at cutoff) ---
+        buckets = {"0-45": 0.0, "46-60": 0.0, "61-90": 0.0, ">90": 0.0}
+        pending_invoices = []  # list of dicts for invoices outstanding as at cutoff, in FIFO order
+
+        for bill in unmatched_bills:
+            unpaid = bill["amount"] - bill["matched"]
+            if unpaid <= 0:
+                continue
+            age = (cutoff_date - bill["date"]).days
+            if age <= 45:
+                bucket = "0-45"
+            elif age <= 60:
+                bucket = "46-60"
+            elif age <= 90:
+                bucket = "61-90"
+            else:
+                bucket = ">90"
+            buckets[bucket] += unpaid
+
+            log_details.append({
+                "Party": party,
+                "Invoice Date": bill["date"],
+                "Invoice Amount": bill["amount"],
+                "Matched Amount": bill["matched"],
+                "Unpaid Amount": unpaid,
+                "Age (in days)": age,
+                "Aging Bucket": bucket,
+                "Remarks": ""
+            })
+
+            # Collect pending invoices for 43B allocation (in same FIFO order)
+            pending_invoices.append({
+                "date": bill["date"],
+                "amount": bill["amount"],
+                "remaining": unpaid  # remaining as at cutoff
+            })
+
+        # --- Now: allocate after-cutoff payments (payments with Date > cutoff_date) in FIFO order to pending_invoices ---
+        payments_after_cutoff = []
+        for _, r in group.iterrows():
+            if r["Debit"] > 0 and r["Date"] > cutoff_date:
+                payments_after_cutoff.append({"date": r["Date"], "amount_remaining": r["Debit"]})
+
+        # Sort payments by date to ensure FIFO order
+        payments_after_cutoff.sort(key=lambda x: x["date"])
+
+        # We'll allocate payments in order to pending invoices in order, capping allocations.
+        # Track per-invoice paid_amt and paid_date (the date when invoice was fully paid by after-cutoff payments).
+        for inv in pending_invoices:
+            inv["paid_amount_after_cutoff"] = 0.0
+            inv["paid_date_after_cutoff"] = None
+
+        # Pointer over payments
+        for pay in payments_after_cutoff:
+            if pay["amount_remaining"] <= 0:
+                continue
+            # allocate to earliest pending invoice with remaining > 0
+            for inv in pending_invoices:
+                if pay["amount_remaining"] <= 0:
+                    break
+                if inv["remaining"] <= 0:
+                    continue
+                alloc = min(inv["remaining"], pay["amount_remaining"])
+                # allocate
+                inv["remaining"] -= alloc
+                inv["paid_amount_after_cutoff"] += alloc
+                # paid_date should be the date of the payment that caused the invoice to be partially or fully cleared
+                # if allocation fully clears the invoice, record that payment date as paid_date_after_cutoff
+                if inv["paid_amount_after_cutoff"] >= (inv.get("amount", 0.0)):
+                    inv["paid_date_after_cutoff"] = pay["date"]
+                else:
+                    # for partial payments, we still may set last payment date (useful for audit),
+                    # but final paid_date (full settlement) will only come when fully cleared.
+                    inv["paid_date_after_cutoff"] = pay["date"]
+                pay["amount_remaining"] -= alloc
+
+        # --- Prepare 43B(h) disallowance entries using only after-cutoff allocations ---
+        for inv in pending_invoices:
+            unpaid_after = inv["remaining"]  # unpaid after applying after-cutoff payments in FIFO order
+            paid_amt_after = inv.get("paid_amount_after_cutoff", 0.0)
+            paid_date_after = inv.get("paid_date_after_cutoff", None)
+
+            # 45-day deadline from invoice date
+            deadline = inv["date"] + pd.Timedelta(days=45)
+
+            # An invoice is considered allowed under 43B if fully paid within 45 days.
+            # Here we check if it was fully settled by after-cutoff payments within deadline
+            # NOTE: payments we used are all after cutoff by construction so paid_date_after > cutoff_date (if any)
+            if paid_amt_after >= (inv.get("amount", 0.0)):
+                # fully paid by after-cutoff payments
+                within_45_days = "Yes" if (paid_date_after is not None and paid_date_after <= deadline) else "No"
+            else:
+                # not fully paid by after-cutoff payments; it remains partially/unpaid => disallowed
+                within_45_days = "No"
+
+            disallowed_flag = "No" if within_45_days == "Yes" else "Yes"
+
+            # Paid amount in report should not exceed the invoice amount (we cap defensively)
+            paid_amt_report = min(paid_amt_after, inv.get("amount", 0.0))
+
+            disallow_43b.append({
+                "Party": party,
+                "Invoice Date": inv["date"],
+                "Invoice Amount": inv.get("amount", 0.0),
+                "Unpaid Amount (after cutoff allocations)": unpaid_after,
+                "Paid Amount (after cutoff)": paid_amt_report,
+                "Paid Date (after cutoff)": paid_date_after,
+                "Within 45 Days": within_45_days,
+                "Disallowed u/s 43B(h)": disallowed_flag
+            })
+
+        # --- Party summary for aging sheet ---
+        party_summary = {
+            "Party": party,
+            "Total Outstanding": sum(buckets.values()),
+            **buckets,
+            "Advance to Supplier": advance_amount
+        }
+        aging_summary.append(party_summary)
+
+    # return dataframes
+    return pd.DataFrame(aging_summary), pd.DataFrame(log_details), pd.DataFrame(disallow_43b)
+
+# -------------------- RUN AND EXPORT -------------------- #
+aging_df, log_df, df_43b_log = calculate_creditor_aging_and_43b(data, CUTOFF_DATE)
+
+output_path = os.path.splitext(file_path)[0] + "_creditor_aging_report_v2.xlsx"
+with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+    aging_df.to_excel(writer, sheet_name="Aging Summary", index=False)
+    log_df.to_excel(writer, sheet_name="FIFO Log", index=False)
+    df_43b_log.to_excel(writer, sheet_name="43B(h) Disallowance", index=False)
+
+print(f"✅ Aging Report + Log saved to:\n{output_path}")
+messagebox.showinfo("Done", f"Aging+43B report created:\n{output_path}")
