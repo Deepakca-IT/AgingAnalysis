@@ -1,97 +1,63 @@
-# Creditors 43B(h) Compliance & Aging Report Tool
+# Tally Export → FIFO Aging & 43B(h) Compliance Report
 
-## Overview
-This Python script processes **raw Excel data exported from Tally** to:
-- Generate **creditors' aging** as of a cutoff date using FIFO logic.
-- Identify **advances to suppliers** separately from regular payables.
-- Perform **Section 43B(h) disallowance** calculations for payments made after the cutoff date.
-- Summarize the results in a **summary sheet** for easy review.
+## 📌 Overview
+This project processes raw ledger data exported from **Tally** and generates a **creditors’ aging report** with a special focus on **Section 43B(h)** compliance.  
+It identifies and categorizes **advances to suppliers**, calculates **aging as per FIFO logic**, and produces a **summary sheet** for quick compliance review.
 
-The script is designed to handle **cutoff-based FIFO adjustments** and ensures that:
-- Payments after the cutoff date are applied to outstanding debits in FIFO order.
-- Paid amounts never exceed the actual outstanding debit values.
-- Only after-cutoff-date payments are considered for **43B(h) disallowance**.
+**Date range of raw export:** 14-02-202X to 15-05-202X
 
 ---
 
-## Data Source
-- **Source**: Tally ERP/Prime Ledger Report
-- **Export Period**: 14-02-202X to 15-05-202X
-- **Type**: Detailed ledger export for creditors
-- **Format**: `.xlsx` (Excel) file
+## 📂 Input Data
+- **Source:** Tally export (Excel)
+- **Data Type:** Detailed ledger report (creditors)
+- **Required Columns:** Date, Particulars, Voucher Type, Voucher No., Debit, Credit
 
 ---
 
-## Output Files
-1. **43B_h_Report.xlsx**
-   - Detailed sheet showing transaction-level adjustments.
-   - Summary sheet with:
-     - Party Name
-     - Opening Payables (as of cutoff date)
-     - Debits after cutoff
-     - Payments after cutoff
-     - Disallowed Amount (43B(h))
-     - Closing Balance
-
-2. **Logs.txt**
-   - Tracks execution details, errors, and skipped entries.
+## ⚙️ Processing Logic
+1. **Load Excel export from Tally**
+2. **FIFO Matching**
+   - Payments (debits) are adjusted against purchases (credits) in chronological order
+   - Excess payments before purchases are flagged as **advances**
+3. **43B(h) Compliance**
+   - Identifies outstanding dues beyond the 45-day limit for MSMEs
+4. **Remarks Tagging**
+   - Flags `Advance to Supplier`
+5. **Summary Sheet**
+   - Party-wise total outstanding, advance amounts, and 43B(h) exposure
 
 ---
 
-## Features
-- ✅ FIFO-based adjustment logic
-- ✅ Handles advance payments
-- ✅ Enforces paid amount ≤ debit amount
-- ✅ Automatic summary generation
-- ✅ Works with large datasets
+## 📊 Output
+- **Detailed Aging Report** → FIFO-based outstanding balance
+- **43B(h) Compliance Report** → List of overdue suppliers beyond MSME limits
+- **Summary Sheet** → At-a-glance totals by supplier
 
 ---
 
-## How It Works
-1. **Cutoff Date**  
-   - User inputs a cutoff date (e.g., `31-03-2025`).
-   - Transactions after this date are treated as post-cutoff.
-
-2. **FIFO Matching**  
-   - Pre-cutoff debits are matched with pre-cutoff credits first.
-   - Any remaining payables as of cutoff are matched with post-cutoff credits for disallowance calculation.
-
-3. **Advance Handling**  
-   - If a payment exceeds purchases before cutoff, the excess is flagged as an **advance**.
+## 🚀 How to Use
+1. Export the **Ledger Report** from Tally:
+   - Go to **Gateway of Tally → Display → Account Books → Ledger**
+   - Select the **Creditors Ledger Group**
+   - Press `Alt+E` → Export → Excel (detailed format)
+   - Ensure **columns: Date, Particulars, Voucher Type, Voucher No., Debit, Credit**
+2. Save the file in the `input` folder
+3. Run the Python script
+4. Output files will be in the `output` folder
 
 ---
 
-## Requirements
-- Python 3.9+
-- Required Libraries:
-  ```bash
-  pip install pandas openpyxl
+## 📈 FIFO + 43B(h) Workflow Diagram
+
+```mermaid
 flowchart TD
-  A[Raw Ledger Excel (Tally export)<br/>14-02-202X → 15-05-202X] --> B[Parse ledger rows<br/>(detect "Ledger:" header)]
-  B --> C[Normalize transactions<br/>(Party, Date, Debit, Credit)]
-  C --> D{Split by Cutoff Date}
-  D --> D1[Pre-cutoff transactions (<= cutoff)]
-  D --> D2[Post-cutoff transactions (> cutoff)]
-
-  D1 --> E1[Pre-cutoff FIFO matching]
-  E1 --> F1[Outstanding invoices as on cutoff]
-  E1 --> ADV[Detect Advances (excess payments before cutoff)]
-
-  D2 --> E2[Collect after-cutoff payments (debits)]
-  F1 --> G[Allocate after-cutoff payments to outstanding invoices<br/>(FIFO order, cap allocations)]
-  E2 --> G
-
-  G --> H[43B(h) check]
-  H -->|Compare paid-date to invoice_date + 45 days| I{Within 45 days?}
-  I -->|Yes| J[Allowed - No disallowance]
-  I -->|No| K[Disallowed amount u/s 43B(h)]
-
-  %% Outputs
-  F1 --> OUT1[Aging Summary (buckets)]
-  E1 --> OUT2[FIFO Log (details)]
-  H --> OUT3[43B(h) Detailed]
-  K --> OUT4[43B(h) Summary per Party]
-
-  style A fill:#f9f,stroke:#333,stroke-width:1px
-  style H fill:#fffae6,stroke:#333
-  style K fill:#ffe6e6,stroke:#333
+    A[📤 Export from Tally] --> B[📄 Read Excel into Pandas]
+    B --> C[🔄 FIFO Matching: Payments vs Purchases]
+    C --> D[🏷 Tag Advances to Supplier]
+    D --> E[📅 Check 43B(h) 45-Day Rule]
+    E --> F[📝 Generate Detailed Aging Report]
+    E --> G[📊 Create Summary Sheet]
+    F --> H[💾 Save Outputs]
+    G --> H
+    H --> I[✅ Final Compliance Reports]
