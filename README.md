@@ -52,12 +52,11 @@ It identifies and categorizes **advances to suppliers**, calculates **aging as p
 
 ```mermaid
 flowchart TD
-    A[📤 Export from Tally] --> B[📄 Read Excel into Pandas]
-    B --> C[🔄 FIFO Matching: Payments vs Purchases]
-    C --> D[🏷 Tag Advances to Supplier]
-    D --> E[📅 Check 43B(h) 45-Day Rule]
-    E --> F[📝 Generate Detailed Aging Report]
-    E --> G[📊 Create Summary Sheet]
-    F --> H[💾 Save Outputs]
-    G --> H
-    H --> I[✅ Final Compliance Reports]
+    A[Ledger Data Exported from Tally] --> B[Clean & Structure Data]
+    B --> C[Identify Payments & Purchases]
+    C --> D[Apply FIFO Logic to Match Payments with Purchases]
+    D --> E[Check 43B(h) 45-Day Rule]
+    E --> F[Flag Non-Compliant Payments]
+    F --> G[Generate Detailed Report]
+    G --> H[Create Summary Report for Management]
+
